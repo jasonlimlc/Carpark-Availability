@@ -55,8 +55,31 @@ export function toggleSavedCarparkId(id: string): string[] {
   return updated;
 }
 
+export async function checkServerlessHealth(): Promise<{
+  status: string;
+  hasLtaKey: boolean;
+  service: string;
+  note?: string;
+}> {
+  try {
+    const res = await fetch('/api/health');
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        status: data.status || 'ok',
+        hasLtaKey: Boolean(data.env?.hasLtaKey),
+        service: data.service || 'ParkSG API Proxy',
+        note: data.env?.note,
+      };
+    }
+  } catch (err) {
+    console.warn('Health check error:', err);
+  }
+  return { status: 'offline', hasLtaKey: false, service: 'Local Client' };
+}
+
 /**
- * Fetch live carpark availability from Data.gov.sg or apply realistic simulation
+ * Fetch live carpark availability from LTA DataMall serverless proxy, Data.gov.sg, or apply realistic simulation
  */
 export async function fetchCarparkAvailability(
   currentCarparks: Carpark[],
@@ -65,7 +88,88 @@ export async function fetchCarparkAvailability(
   const now = new Date();
   const timeString = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
-  // If user enabled Live Data.gov.sg API
+  // 1. Try serverless LTA DataMall proxy (/api/carparkavailability)
+  try {
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+    };
+    if (config.ltaApiKey) {
+      headers['AccountKey'] = config.ltaApiKey;
+    }
+
+    const ltaResponse = await fetch('/api/carparkavailability?fetchAll=true', {
+      headers,
+    });
+
+    if (ltaResponse.ok) {
+      const json = await ltaResponse.json();
+      const records = json?.value;
+
+      if (Array.isArray(records) && records.length > 0) {
+        // Build fast lookup by CarParkID and Development name
+        const ltaMap = new Map<string, { carAvail?: number; motoAvail?: number; heavyAvail?: number }>();
+
+        for (const item of records) {
+          const idKey = (item.CarParkID || '').toUpperCase().trim();
+          const devKey = (item.Development || '').toUpperCase().trim();
+          const lots = Number(item.AvailableLots) || 0;
+          const lotType = item.LotType || 'C';
+
+          const existing = ltaMap.get(idKey) || {};
+          if (lotType === 'C') existing.carAvail = lots;
+          else if (lotType === 'Y') existing.motoAvail = lots;
+          else if (lotType === 'H') existing.heavyAvail = lots;
+
+          ltaMap.set(idKey, existing);
+          if (devKey) {
+            ltaMap.set(devKey, existing);
+          }
+        }
+
+        let matchCount = 0;
+        const updated = currentCarparks.map((cp) => {
+          const match =
+            ltaMap.get(cp.carparkNo.toUpperCase().trim()) ||
+            ltaMap.get(cp.id.toUpperCase().trim()) ||
+            ltaMap.get(cp.name.toUpperCase().trim());
+
+          if (match && match.carAvail !== undefined) {
+            matchCount++;
+            return {
+              ...cp,
+              lots: {
+                ...cp.lots,
+                car: {
+                  ...cp.lots.car,
+                  available: Math.min(match.carAvail, cp.lots.car.total),
+                },
+                motorcycle: cp.lots.motorcycle && match.motoAvail !== undefined
+                  ? { ...cp.lots.motorcycle, available: match.motoAvail }
+                  : cp.lots.motorcycle,
+                heavyVehicle: cp.lots.heavyVehicle && match.heavyAvail !== undefined
+                  ? { ...cp.lots.heavyVehicle, available: match.heavyAvail }
+                  : cp.lots.heavyVehicle,
+              },
+              lastUpdated: timeString,
+            };
+          }
+          return { ...cp, lastUpdated: timeString };
+        });
+
+        if (matchCount > 0) {
+          return {
+            carparks: updated,
+            source: 'live_lta',
+            timestamp: timeString,
+          };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('LTA serverless proxy fetch attempt returned:', err);
+  }
+
+  // 2. If user enabled Live Data.gov.sg API
   if (config.useLiveDatagov) {
     try {
       const response = await fetch('https://api.data.gov.sg/v1/transport/carpark-availability', {
@@ -92,7 +196,6 @@ export async function fetchCarparkAvailability(
             }
           }
 
-          // Merge with our rich local dataset
           const updated = currentCarparks.map((cp) => {
             const liveMatch = mapByNo.get(cp.carparkNo);
             if (liveMatch && liveMatch.carLots !== undefined) {
@@ -123,9 +226,8 @@ export async function fetchCarparkAvailability(
     }
   }
 
-  // Realistic simulation: lots fluctuate naturally (cars enter/leave)
+  // 3. Realistic simulation: lots fluctuate naturally (cars enter/leave)
   const simulated = currentCarparks.map((cp) => {
-    // Generate subtle delta (-3 to +3)
     const delta = Math.floor(Math.random() * 7) - 3;
     const currentLots = cp.lots.car.available;
     const totalLots = cp.lots.car.total;
